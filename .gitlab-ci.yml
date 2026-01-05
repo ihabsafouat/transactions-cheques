@@ -1,0 +1,126 @@
+workflow:
+  rules:
+    # Pipeline pour les Merge Requests
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    # Pipeline pour les pushes sur develop
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == "develop"'
+    # Sinon: pas de pipeline
+    - when: never
+
+stages:
+  - test
+  - build_jar
+  - docker_build
+  - compose_smoke
+
+variables:
+  # Maven
+  MAVEN_CLI_OPTS: "-B -e -V"
+  MAVEN_OPTS: "-Dmaven.repo.local=$CI_PROJECT_DIR/.m2/repository"
+
+  # Docker (dind)
+  DOCKER_TLS_CERTDIR: ""
+  DOCKER_DRIVER: overlay2
+
+cache:
+  key: "maven-${CI_PROJECT_NAME}"
+  paths:
+    - .m2/repository
+  policy: pull-push
+
+# -----------------------
+# 1) TESTS
+# -----------------------
+test_job:
+  stage: test
+  image: maven:3.9.6-eclipse-temurin-17
+  script:
+    - mvn $MAVEN_CLI_OPTS clean test
+  artifacts:
+    when: always
+    reports:
+      junit: target/surefire-reports/*.xml
+    expire_in: 7 days
+
+# -----------------------
+# 2) BUILD JAR
+# -----------------------
+build_jar:
+  stage: build_jar
+  image: maven:3.9.6-eclipse-temurin-17
+  script:
+    - mvn $MAVEN_CLI_OPTS clean package -DskipTests
+    - ls -lah target/
+  artifacts:
+    when: always
+    paths:
+      - target/*.jar
+    expire_in: 7 days
+  needs:
+    - test_job
+
+# -----------------------
+# 3) DOCKER BUILD (via Dockerfile)
+# -----------------------
+docker_build:
+  stage: docker_build
+  image: docker:24.0.9
+  services:
+    - name: docker:24.0.9-dind
+  script:
+    - docker version
+    - docker info
+    # Build image locale CI (pas de push)
+    - docker build -t cheques:${CI_COMMIT_SHORT_SHA} .
+    - docker images | head
+
+# -----------------------
+# 4) DOCKER COMPOSE SMOKE TEST
+#    - lance ton docker-compose + teste /actuator/health
+# -----------------------
+compose_smoke:
+  stage: compose_smoke
+  image: docker:24.0.9
+  services:
+    - name: docker:24.0.9-dind
+  variables:
+    DOCKER_TLS_CERTDIR: ""
+  script:
+    - docker version
+    - docker info
+
+    # 1) on construit l'image avec Dockerfile (compose peut aussi build, mais on fixe l'image)
+    - docker build -t cheques:${CI_COMMIT_SHORT_SHA} .
+
+    # 2) Override compose spécifique CI: on évite les conflits de ports
+    #    et on force l'image construite
+    - |
+      cat > docker-compose.ci.override.yml <<'YAML'
+      services:
+        cheques:
+          image: cheques:${CI_COMMIT_SHORT_SHA}
+          ports: []
+          environment:
+            SPRING_PROFILES_ACTIVE: "prod"
+            SERVER_PORT: "8080"
+      YAML
+
+    # 3) Lancer via compose (ton docker-compose.yml + override CI)
+    - docker compose -f docker-compose.yml -f docker-compose.ci.override.yml up -d
+
+    # 4) Attendre que le service soit UP
+    - |
+      echo "Waiting for /actuator/health..."
+      for i in $(seq 1 30); do
+        if docker compose exec -T cheques wget -qO- http://127.0.0.1:8080/actuator/health | grep -q "UP"; then
+          echo "✅ Health is UP"
+          exit 0
+        fi
+        echo "… not ready yet ($i/30)"
+        sleep 2
+      done
+      echo "❌ Health never became UP"
+      docker compose logs cheques
+      exit 1
+  after_script:
+    - docker compose -f docker-compose.yml -f docker-compose.ci.override.yml down -v || true
