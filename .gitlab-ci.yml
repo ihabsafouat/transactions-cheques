@@ -3,6 +3,7 @@ workflow:
     # Pipeline pour les Merge Requests
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
     # Pipeline pour les pushes sur develop
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == "main"'
     - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == "develop"'
     # Sinon: pas de pipeline
     - when: never
